@@ -88,6 +88,10 @@ def generate_query_class(query_params, class_name):
         elif isinstance(value, str):
             if value == "true" or value == "false":
                 dart_type = "final bool?"
+            elif value.isdigit():
+                    dart_type = "final int?"
+            elif value.replace('.', '').isdigit():
+                    dart_type = "final double?"
             else:
                 dart_type = "final String?"
 
@@ -137,7 +141,14 @@ def generate_body_class(body_raw, class_name):
         elif isinstance(value, float):
             dart_type = "final double?"
         elif isinstance(value, str):
-            dart_type = "final String?"
+            if value == "true" or value == "false":
+                dart_type = "final bool?"
+            elif value.isdigit():
+                    dart_type = "final int?"
+            elif value.replace('.', '').isdigit():
+                    dart_type = "final double?"
+            else:
+                dart_type = "final String?"
 
         class_code += f"  {dart_type} {key};\n"
 
@@ -163,32 +174,41 @@ def generate_dio_function(request_name, request):
     body = request.get('body', None)
     auth = request.get('auth', None)
 
-    # Extract the path and handle dynamic parameters
+    # Remove query parameters from the URL
+    url_without_query = re.split(r'\?', url)[0]
+
+    # Extract the base URL including optional port
+    base_url_match = re.match(r'^(https?://[a-zA-Z0-9.-]+(:[0-9]+)?)(/.*)?$', url_without_query)
+    if base_url_match:
+        base_url = base_url_match.group(1)  # Base URL (e.g., http://localhost:8080)
+        endpoint = base_url_match.group(3) or ''  # Endpoint is the part after the base URL
+    else:
+        base_url = None
+        endpoint = url_without_query  # If no match, treat the entire URL as the endpoint
+
+    # Replace hardcoded base URL with `$baseUrl`
+    dart_url = f"$baseUrl{endpoint}" if base_url else url_without_query
+
+    # Handle dynamic path parameters
     path = request['url'].get('path', [])
-    dart_url, path_parameters = handle_path_parameters(url, path)
+    dart_url, path_parameters = handle_path_parameters(dart_url, path)
 
-    # Remove query string from URL
-    base_url = dart_url.split('?')[0]  # Get the base URL without query string
-
-    # Handle query parameters
+    # Extract query parameters from the original URL
     query_params = {param['key']: param['value'] for param in request['url'].get('query', [])}
 
     # Generate Dart class for query parameters
     query_params_class_code = ''
     if query_params:
-        query_params_class_code = generate_query_class(query_params, upper_camel_case(request_name+'_query_params'))
+        query_params_class_code = generate_query_class(query_params, upper_camel_case(request_name + '_query_params'))
 
     # Generate Dart class for body if present
     body_class_code = ''
     if body:
         body_raw = body.get('raw', '')  # Raw body data
         if body_raw:
-            body_class_code = generate_body_class(body_raw, upper_camel_case(request_name+'_body'))
+            body_class_code = generate_body_class(body_raw, upper_camel_case(request_name + '_body'))
 
-    # Replace URL variables (like {{prefix}}) with Dart variables
-    dart_url = replace_url_variables(base_url)  # Use base_url after removing query string
-
-    # Extract all URL variables and pass as parameters
+    # Extract all variables for the function signature
     url_variables = extract_variables(dart_url)
     header_variables = [
         extract_variables(header['value']) for header in headers if '{{' in header['value']]
@@ -198,71 +218,65 @@ def generate_dio_function(request_name, request):
     # Convert all variables to lowerCamelCase for Dart function parameters
     dart_parameters = ', '.join([f"required String {lower_camel_case(var)}" for var in all_variables])
 
-    # If there is an accessToken, add it as a parameter
+    # Add `baseUrl` as a required parameter
+    if base_url:
+        dart_parameters += ', required String baseUrl'
+
+    # Add query parameters
+    if query_params:
+        dart_parameters += f', required {upper_camel_case(request_name + "_query_params")} {lower_camel_case(snake_case(request_name))}QueryParams'
+
+    # Add body parameters
+    if body_class_code:
+        dart_parameters += f', required {upper_camel_case(request_name + "_body")} {lower_camel_case(snake_case(request_name))}Body'
+
+    # Add accessToken if present
     if auth and auth.get('type') == 'bearer':
         dart_parameters += ', required String accessToken'
 
-    # Add prefix as a parameter to the function (dynamic, not fixed to 'server')
-    if contains_placeholder(url):
-        dart_parameters += f', required String {dart_url.split("/")[0].replace("$", "")}'
-
-    # Add query parameters as dynamic parameters
-    if query_params:
-        dart_parameters += f', required {upper_camel_case(request_name+'_query_params')} {lower_camel_case(snake_case(request_name))}QueryParams,'
-
-    # Add body parameters as dynamic parameters
-    if body_class_code:
-        dart_parameters += f', required {upper_camel_case(request_name+'_body')} {lower_camel_case(snake_case(request_name))}Body,'
-
-    # Start the function definition
+    # Generate the function
     function_name = lower_camel_case(request_name)
     dart_code = f"import 'package:dio/dio.dart';\n\n"
     if query_params:
         dart_code += f"import '{snake_case(request_name)}_query_params.dart';\n"
     if body_class_code:
         dart_code += f"import '{snake_case(request_name)}_body.dart';\n\n"
-    dart_code = dart_code + f"class {upper_camel_case(request_name)} {{\n   static Future<Response> {function_name}({{{dart_parameters}}}) async {{\n" if all_variables else f"Future<void> {function_name}() async {{\n"
+    dart_code += f"class {upper_camel_case(request_name)} {{\n"
+    dart_code += f"  static Future<Response> {function_name}({{{dart_parameters}}}) async {{\n"
     dart_code += "    Dio dio = Dio();\n"
 
     # Add headers dynamically
     if headers:
-        dart_code += "     dio.options.headers = {\n"
+        dart_code += "    dio.options.headers = {\n"
         for header in headers:
             header_value = header['value']
             if '{{' in header_value:
                 key = header['key']
-                dart_code += f"     '{key}': {replace_header_variables(header_value)},\n"
+                dart_code += f"      '{key}': {replace_header_variables(header_value)},\n"
             else:
-                dart_code += f"     '{header['key']}': '{header_value}',\n"
-        dart_code += "  };\n"
+                dart_code += f"      '{header['key']}': '{header_value}',\n"
+        dart_code += "    };\n"
 
     # Add authorization if present
     if auth and auth.get('type') == 'bearer':
         dart_code += f"    dio.options.headers['Authorization'] = 'Bearer $accessToken';\n"
 
-    # Prepare the request call with dynamic query parameters and dynamic body
-    dart_code += f"    Response response = await dio.{method}(\n        '{dart_url}',\n"
-    
-    # Add query parameters to the request if present
+    # Prepare the request call
+    dart_code += f"    Response response = await dio.{method}(\n"
+    dart_code += f"      '{dart_url}',\n"
     if query_params:
-        dart_code += f"         queryParameters: {lower_camel_case(snake_case(request_name))}QueryParams.toJson(),\n"  # Pass the query parameters dynamically using toJson
-
-    # Add body if present (use the dynamic data parameter)
+        dart_code += f"      queryParameters: {lower_camel_case(snake_case(request_name))}QueryParams.toMap(),\n"
     if body_class_code:
-        dart_code += f"         data: {lower_camel_case(snake_case(request_name))}Body.toJson(),\n"  # Pass the body dynamically using toJson
+        dart_code += f"      data: {lower_camel_case(snake_case(request_name))}Body.toJson(),\n"
+    dart_code += "    );\n\n"
+    dart_code += "    print(response.data);\n\n"
+    dart_code += "    return response;\n"
+    dart_code += "  }\n}\n"
 
-    # Close the request call
-    dart_code += "      );\n\n"
-    dart_code += "      print(response.data);\n\n"
-    dart_code += "      return response;\n"
-    dart_code += "  }\n}"
-
-    # Generate filename and folder for the request
+    # Generate filename and folder
     folder_name = snake_case(request_name)
     filename = f"{folder_name}.dart"
     return dart_code, folder_name, filename, query_params_class_code, body_class_code
-
-
 def process_postman_collection(collection, output_dir):
     """Process the Postman collection and generate Dart files for each request."""
     if not os.path.exists(output_dir):
